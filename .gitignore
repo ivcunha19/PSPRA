@@ -1,55 +1,46 @@
-# Prerequisites
-*.d
+.env
+config.ini
+credentials.h
+*secret*
+*token*
 
-# Object files
-*.o
-*.ko
-*.obj
+
+*.gba
+*.sfc
+*.smc
+*.nes
+*.bin
+*.iso
+*.cso
+
+EBOOT.PBP
+PARAM.SFO
 *.elf
-
-# Linker output
-*.ilk
-*.map
-*.exp
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Libraries
-*.lib
+*.prx
+*.o
 *.a
-*.la
-*.lo
+*.d
+*.map
 
-# Shared objects (inc. Windows DLLs)
-*.dll
-*.so
-*.so.*
-*.dylib
 
-# Executables
-*.exe
 *.out
-*.app
-*.i*86
-*.x86_64
-*.hex
+*.exe
+*.so
+build/
+bin/
+client
+server
+cliente_envio
 
-# Debug files
-*.dSYM/
-*.su
-*.idb
-*.pdb
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
 
-# Kernel Module Compile Results
-*.mod*
-*.cmd
-.tmp_versions/
-modules.order
-Module.symvers
-Mkfile.old
-dkms.conf
-
-# debug information files
-*.dwo
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
