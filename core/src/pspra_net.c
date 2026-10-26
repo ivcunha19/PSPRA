@@ -1,5 +1,5 @@
 #include <stdio.h>
-#include <stdlib.h> // Necessário para malloc, realloc e free
+#include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -8,7 +8,7 @@
 #include <unistd.h>
 
 #include "credentials.h"
-#include "pspraNet.h"
+#include "pspra_net.h"
 
 void pspRaServerCall(const rc_api_request_t* request,
                      rc_client_server_callback_t callback,
@@ -21,7 +21,7 @@ void pspRaServerCall(const rc_api_request_t* request,
 
     int networkSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (networkSocket < 0) {
-        perror("[PSPRA Net] Error creating socket");
+        perror("[PSPRA Net] Failed to create socket");
         serverResponse.http_status_code = 500;
         callback(&serverResponse, callback_data);
         return;
@@ -33,22 +33,22 @@ void pspRaServerCall(const rc_api_request_t* request,
     serverAddress.sin_port = htons(PSPRA_PROXY_PORT);
 
     if (inet_pton(AF_INET, PSPRA_PROXY_IP, &serverAddress.sin_addr) <= 0) {
-        printf("[PSPRA Net] Endereço IP inválido: %s\n", PSPRA_PROXY_IP);
+        printf("[PSPRA Net] Invalid proxy IP address: %s\n", PSPRA_PROXY_IP);
         close(networkSocket);
         serverResponse.http_status_code = 500;
         callback(&serverResponse, callback_data);
         return;
     }
 
-    int connectionStatus = connect(networkSocket, (struct sockaddr *)&serverAddress, sizeof(serverAddress));
-    if (connectionStatus == -1) {
-        perror("[PSPRA Net] Error connecting with Proxy");
+    if (connect(networkSocket, (struct sockaddr *)&serverAddress, sizeof(serverAddress)) == -1) {
+        perror("[PSPRA Net] Proxy connection failed");
         close(networkSocket);
         serverResponse.http_status_code = 500;
         callback(&serverResponse, callback_data);
-        return; 
+        return;
     }
 
+    // Protocol: "URL\nPOST_DATA"
     send(networkSocket, request->url, strlen(request->url), 0);
     send(networkSocket, "\n", 1, 0);
 
@@ -56,6 +56,7 @@ void pspRaServerCall(const rc_api_request_t* request,
         send(networkSocket, request->post_data, strlen(request->post_data), 0);
     }
 
+    // Notify the proxy that we finished sending data
     shutdown(networkSocket, SHUT_WR);
 
     size_t capacity = 4096;
@@ -73,12 +74,12 @@ void pspRaServerCall(const rc_api_request_t* request,
     }
 
     if (totalReceived > 0) {
-        sResponse[totalReceived] = '\0'; 
+        sResponse[totalReceived] = '\0';
         serverResponse.body = sResponse;
         serverResponse.body_length = totalReceived;
         serverResponse.http_status_code = 200;
     } else {
-        printf("[PSPRA Net] Nenhuma resposta recebida do Proxy.\n");
+        printf("[PSPRA Net] Empty response received from proxy.\n");
         serverResponse.http_status_code = 500;
     }
 
