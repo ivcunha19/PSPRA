@@ -3,7 +3,6 @@
 
 #include "rc_client.h"
 
-// Assinatura exata exigida pela biblioteca rcheevos
 void pspRaServerCall(const rc_api_request_t* request,
                      rc_client_server_callback_t callback,
                      void* callback_data,

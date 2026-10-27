@@ -10,8 +10,8 @@
 #define DUMMY_RAM_SIZE 65536
 static uint8_t g_dummy_ram[DUMMY_RAM_SIZE];
 
-// Official RetroAchievements MD5 hash for Super Mario Bros. (NES)
-#define TEST_ROM_HASH "555f9f13f1f0f5c4138a3b2a58c34c88"
+// Official RetroAchievements MD5 hash for Super Mario World (SNES - USA)
+#define TEST_ROM_HASH "cdd3c8c37322978ca8669b34bc89c804"
 
 int main(void) {
     printf("==================================================\n");
