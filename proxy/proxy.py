@@ -1,12 +1,13 @@
 import socket
 import requests
+import json
 from urllib.parse import parse_qs
 
 HOST = "0.0.0.0"
 PORT = 9002
 
 HEADERS = {
-    "User-Agent": "PSPRA/0.1.0 (PSP Homebrew; Softcore) rcheevos/11.0",
+    "User-Agent": "PSPRA/0.1.0 (PSP Homebrew; Softcore) rcheevos/12.0",
     "Content-Type": "application/x-www-form-urlencoded"
 }
 
@@ -27,8 +28,19 @@ def log_request(url, post_data):
     params = parse_qs(post_data)
     command = params.get('r', ['unknown'])[0]
     user = params.get('u', [''])[0]
-    
     print(f"[PSP -> RA] Command: '{command}' | User: '{user}' | URL: {url}")
+    return command
+
+def inspect_achievement_memaddr(raw_json_bytes, target_ids=(342, 4874)):
+    """Prints the exact memory trigger conditions for specific achievement IDs"""
+    try:
+        data = json.loads(raw_json_bytes.decode('utf-8'))
+        for ach_set in data.get("Sets", []):
+            for ach in ach_set.get("Achievements", []):
+                if ach.get("ID") in target_ids:
+                    print(f"  [Trigger Debug] ID {ach['ID']} ({ach['Title']}): MemAddr = {ach['MemAddr']}")
+    except Exception as e:
+        print(f"  [Trigger Debug] Could not parse JSON: {e}")
 
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -43,7 +55,7 @@ while True:
         raw_payload = recv_all_from_psp(client_sock)
         if "\n" in raw_payload:
             url, post_data = raw_payload.split("\n", 1)
-            log_request(url, post_data)
+            cmd = log_request(url, post_data)
 
             if post_data:
                 resp = requests.post(url, data=post_data, headers=HEADERS, timeout=10)
@@ -51,6 +63,10 @@ while True:
                 resp = requests.get(url, headers=HEADERS, timeout=10)
 
             print(f"[RA -> PSP] HTTP {resp.status_code} | Size: {len(resp.content)} bytes")
+            
+            if cmd == "achievementsets" and resp.status_code == 200:
+                inspect_achievement_memaddr(resp.content)
+
             client_sock.sendall(resp.content)
     except Exception as e:
         print(f"[PSPRA Proxy] Error: {e}")
