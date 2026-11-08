@@ -350,41 +350,77 @@ int main(int argc, char *argv[]) {
             pspra_login(PSPRA_RA_USER, PSPRA_RA_PASS);
             pspra_load_game(TEST_ROM_HASH);
 
-            pspDebugScreenPrintf("[Runner] Running 120 emulated frames (60 FPS)...\n");
-            for (int frame = 0; frame < 120 && g_running; frame++) {
-                if (frame == 10) {
-                    pspDebugScreenPrintf("[Runner] Frame 10: Mario enters level...\n");
-                    dummy_ram[0x0100] = 0x14; // Game Mode: In active level
-                    dummy_ram[0x0071] = 0x00;
-                    dummy_ram[0x13D4] = 0x00;
-                    dummy_ram[0x1426] = 0x00;
-                    dummy_ram[0x0019] = 0x00;
-                    dummy_ram[0x187A] = 0x00;
-                }
-                if (frame == 60) {
-                    pspDebugScreenPrintf("[Runner] Frame 60: Mario gets Feather & Yoshi!\n");
-                    dummy_ram[0x0019] = 0x02; // Cape / Feather -> ID 4874
-                    dummy_ram[0x187A] = 0x01; // Riding Yoshi -> ID 342
-                    dummy_ram[0x0DC1] = 0x01;
-                }
+            // Baseline SMW WRAM State (Active Gameplay in Yoshi's Island 2)
+            dummy_ram[0x0100] = 0x14; // Game Mode: In-Level Gameplay
+            dummy_ram[0x009D] = 0x00; // Sprites/Game unpaused
+            dummy_ram[0x13BF] = 0x29; // Translevel: Yoshi's Island 2
+            dummy_ram[0x1420] = 4;    // 4/5 Dragon Coins collected
+            dummy_ram[0x1422] = 4;    // 4/5 Dragon Coins collected
+            dummy_ram[0x0DBE] = 97;   // 98 Lives in status bar
+            dummy_ram[0x0DB4] = 97;   // 98 Lives in status bar
+
+            // Prime rcheevos delta buffers for 10 frames
+            for (int i = 0; i < 10 && g_running; i++) {
                 pspra_update_frame();
                 sceDisplayWaitVblankStart();
             }
-            pspDebugScreenPrintf("[Runner] Frame simulation finished!\n");
+
+            pspDebugScreenPrintf("\n==================================================\n");
+            pspDebugScreenPrintf("   SMW Interactive Achievement Trigger Ready      \n");
+            pspDebugScreenPrintf("   [CROSS (X)] : Inject SMW RAM Trigger           \n");
+            pspDebugScreenPrintf("   [START]     : Exit to XMB                      \n");
+            pspDebugScreenPrintf("==================================================\n");
+
+            SceCtrlData pad, old_pad;
+            sceCtrlReadBufferPositive(&old_pad, 1);
+
+            while (g_running) {
+                sceCtrlReadBufferPositive(&pad, 1);
+                unsigned int pressed = pad.Buttons & ~old_pad.Buttons;
+                old_pad = pad;
+
+                if (pressed & PSP_CTRL_CROSS) {
+                    pspDebugScreenPrintf("[Test] CROSS pressed! Injecting SMW RAM states...\n");
+
+                    // Frame N (Pre-condition)
+                    dummy_ram[0x0100] = 0x14;
+                    dummy_ram[0x1420] = 4;
+                    dummy_ram[0x1422] = 4;
+                    dummy_ram[0x0DBE] = 97;
+                    dummy_ram[0x0DB4] = 97;
+                    dummy_ram[0x0019] = 0x00;
+                    pspra_update_frame();
+
+                    // Frame N+1 (Trigger Mutation)
+                    dummy_ram[0x1420] = 5;    // 5th Dragon Coin
+                    dummy_ram[0x1422] = 5;    // 5th Dragon Coin
+                    dummy_ram[0x0DBE] = 98;   // 99 Lives
+                    dummy_ram[0x0DB4] = 98;   // 99 Lives
+                    dummy_ram[0x0019] = 0x02; // Cape Mario power-up
+                    pspra_update_frame();
+
+                    pspDebugScreenPrintf("[Test] SMW RAM Trigger injected (5 Dragon Coins, 99 Lives, Cape Mario)!\n");
+                }
+
+                if (pressed & PSP_CTRL_START) {
+                    break;
+                }
+
+                pspra_update_frame();
+                sceDisplayWaitVblankStart();
+            }
         }
     } else {
         pspDebugScreenPrintf("[Fatal] Wi-Fi connection cancelled or failed.\n");
-    }
-
-    pspDebugScreenPrintf("\nPress [START] to exit to XMB.\n");
-
-    SceCtrlData pad;
-    while (g_running) {
-        sceCtrlReadBufferPositive(&pad, 1);
-        if (pad.Buttons & PSP_CTRL_START) {
-            break;
+        pspDebugScreenPrintf("\nPress [START] to exit to XMB.\n");
+        SceCtrlData pad;
+        while (g_running) {
+            sceCtrlReadBufferPositive(&pad, 1);
+            if (pad.Buttons & PSP_CTRL_START) {
+                break;
+            }
+            sceDisplayWaitVblankStart();
         }
-        sceDisplayWaitVblankStart();
     }
 
     pspDebugScreenPrintf("[Runner] Cleaning up and exiting...\n");
