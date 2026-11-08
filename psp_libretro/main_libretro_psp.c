@@ -5,6 +5,7 @@
 #include <psputility.h>
 #include <psppower.h>
 #include <pspaudio.h>
+#include <pspiofilemgr.h>
 #include <pspnet.h>
 #include <pspnet_inet.h>
 #include <pspnet_apctl.h>
@@ -13,6 +14,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
+#include <strings.h>
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -45,6 +47,12 @@ static enum retro_pixel_format g_pixel_format = RETRO_PIXEL_FORMAT_0RGB1555;
 static int g_audio_ch = -1;
 static int g_audio_buf_idx = 0;
 static int16_t __attribute__((aligned(64))) g_audio_buf[2][AUDIO_SAMPLES * 2];
+
+static uint8_t *g_sram_ptr = NULL;
+static size_t   g_sram_size = 0;
+static uint32_t g_sram_checksum = 0;
+static char     g_sram_path[256] = {0};
+static int      g_sram_osd_frames = 0;
 
 // ============================================================================
 // COMPACT 8x8 ASCII BITMAP FONT (0x20 .. 0x7E) FOR OSD NOTIFICATION BANNER
@@ -199,10 +207,80 @@ static void osd_clear_banner(uint16_t *vram) {
 }
 
 // ============================================================================
-// 1. PSP EXIT CALLBACK (HOME BUTTON)
+// 1. BATTERY-BACKED SRAM PERSISTENCE & PSP EXIT CALLBACK (HOME BUTTON)
 // ============================================================================
+static uint32_t compute_sram_checksum(const uint8_t *data, size_t size) {
+    if (!data || size == 0) {
+        return 0;
+    }
+    uint32_t hash = 2166136261u;
+    size_t words = size >> 2;
+    const uint32_t *wptr = (const uint32_t *)data;
+    for (size_t i = 0; i < words; i++) {
+        hash ^= wptr[i];
+        hash *= 16777619u;
+    }
+    for (size_t i = (words << 2); i < size; i++) {
+        hash ^= data[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static void build_sram_path(const char *rom_path, char *out_sram_path, size_t max_len) {
+    const char *base = strrchr(rom_path, '/');
+    base = base ? (base + 1) : rom_path;
+
+    char name_no_ext[220];
+    strncpy(name_no_ext, base, sizeof(name_no_ext) - 1);
+    name_no_ext[sizeof(name_no_ext) - 1] = '\0';
+
+    char *dot = strrchr(name_no_ext, '.');
+    if (dot) {
+        *dot = '\0';
+    }
+
+    snprintf(out_sram_path, max_len, "saves/%s.srm", name_no_ext);
+}
+
+static void load_sram_from_disk(const char *sram_path) {
+    g_sram_ptr = (uint8_t *)retro_get_memory_data(RETRO_MEMORY_SAVE_RAM);
+    g_sram_size = retro_get_memory_size(RETRO_MEMORY_SAVE_RAM);
+
+    if (g_sram_ptr == NULL || g_sram_size == 0 || sram_path == NULL || sram_path[0] == '\0') {
+        return;
+    }
+
+    FILE *fp = fopen(sram_path, "rb");
+    if (fp) {
+        size_t read_bytes = fread(g_sram_ptr, 1, g_sram_size, fp);
+        fclose(fp);
+        if (!g_in_gameplay) {
+            pspDebugScreenPrintf("[SRAM] Loaded %u bytes from %s\n",
+                                 (unsigned int)read_bytes, sram_path);
+        }
+    }
+    g_sram_checksum = compute_sram_checksum(g_sram_ptr, g_sram_size);
+}
+
+static int save_sram_to_disk(const char *sram_path) {
+    if (g_sram_ptr == NULL || g_sram_size == 0 || sram_path == NULL || sram_path[0] == '\0') {
+        return 0;
+    }
+
+    FILE *fp = fopen(sram_path, "wb");
+    if (!fp) {
+        return 0;
+    }
+    size_t written = fwrite(g_sram_ptr, 1, g_sram_size, fp);
+    fclose(fp);
+    g_sram_checksum = compute_sram_checksum(g_sram_ptr, g_sram_size);
+    return (written == g_sram_size) ? 1 : 0;
+}
+
 static int exit_callback(int arg1, int arg2, void *common) {
     (void)arg1; (void)arg2; (void)common;
+    save_sram_to_disk(g_sram_path);
     g_running = 0;
     return 0;
 }
@@ -221,6 +299,160 @@ static int setup_callbacks(void) {
         sceKernelStartThread(thid, 0, 0);
     }
     return thid;
+}
+
+// ============================================================================
+// 1B. INTERACTIVE ON-SCREEN ROM FILE SELECTOR (.SFC / .SMC)
+// ============================================================================
+#define MAX_ROM_FILES 64
+
+static char g_rom_list[MAX_ROM_FILES][256];
+static char g_rom_paths[MAX_ROM_FILES][256];
+
+static int has_snes_rom_extension(const char *filename) {
+    if (!filename) {
+        return 0;
+    }
+    const char *dot = strrchr(filename, '.');
+    if (!dot) {
+        return 0;
+    }
+    return (strcasecmp(dot, ".sfc") == 0 || strcasecmp(dot, ".smc") == 0);
+}
+
+static int scan_rom_directory(const char *dir_path, int add_dir_prefix) {
+    SceUID dfd = sceIoDopen(dir_path);
+    if (dfd < 0) {
+        return 0;
+    }
+
+    int count = 0;
+    SceIoDirent entry;
+    memset(&entry, 0, sizeof(entry));
+
+    while (count < MAX_ROM_FILES && sceIoDread(dfd, &entry) > 0) {
+        if (entry.d_name[0] == '.') {
+            memset(&entry, 0, sizeof(entry));
+            continue;
+        }
+        if (FIO_S_ISDIR(entry.d_stat.st_mode)) {
+            memset(&entry, 0, sizeof(entry));
+            continue;
+        }
+        if (has_snes_rom_extension(entry.d_name)) {
+            strncpy(g_rom_list[count], entry.d_name, sizeof(g_rom_list[count]) - 1);
+            g_rom_list[count][sizeof(g_rom_list[count]) - 1] = '\0';
+
+            if (add_dir_prefix) {
+                snprintf(g_rom_paths[count], sizeof(g_rom_paths[count]),
+                         "%s/%s", dir_path, entry.d_name);
+            } else {
+                strncpy(g_rom_paths[count], entry.d_name, sizeof(g_rom_paths[count]) - 1);
+                g_rom_paths[count][sizeof(g_rom_paths[count]) - 1] = '\0';
+            }
+            count++;
+        }
+        memset(&entry, 0, sizeof(entry));
+    }
+
+    sceIoDclose(dfd);
+    return count;
+}
+
+// Returns 1 if a ROM was selected (path written to out_path), 0 if user chose to exit
+static int select_rom_file(char *out_path, size_t max_len) {
+    sceIoMkdir("roms", 0777);
+
+    const char *scanned_location = "./roms/";
+    int count = scan_rom_directory("roms", 1);
+    if (count == 0) {
+        scanned_location = "./";
+        count = scan_rom_directory(".", 0);
+    }
+
+    SceCtrlData pad, old_pad;
+    sceCtrlReadBufferPositive(&old_pad, 1);
+
+    if (count == 0) {
+        pspDebugScreenClear();
+        pspDebugScreenSetXY(0, 0);
+        pspDebugScreenPrintf("=== PSPRA Libretro - Select SNES ROM ===\n\n");
+        pspDebugScreenPrintf("[Error] No .sfc or .smc ROM files found in ./ or ./roms/! Press START to exit.\n");
+
+        while (g_running) {
+            sceCtrlReadBufferPositive(&pad, 1);
+            unsigned int pressed = pad.Buttons & ~old_pad.Buttons;
+            old_pad = pad;
+            if (pressed & PSP_CTRL_START) {
+                break;
+            }
+            sceDisplayWaitVblankStart();
+        }
+        return 0;
+    }
+
+    int selected = 0;
+    const int max_visible = 22;
+
+    while (g_running) {
+        pspDebugScreenClear();
+        pspDebugScreenSetXY(0, 0);
+        pspDebugScreenPrintf("=== PSPRA Libretro - Select SNES ROM ===\n");
+        pspDebugScreenPrintf("Directory: %s (%d ROM%s found)\n\n",
+                             scanned_location, count, (count == 1) ? "" : "s");
+
+        int start_idx = 0;
+        if (count > max_visible) {
+            start_idx = selected - (max_visible / 2);
+            if (start_idx < 0) {
+                start_idx = 0;
+            }
+            if (start_idx + max_visible > count) {
+                start_idx = count - max_visible;
+            }
+        }
+        int end_idx = start_idx + max_visible;
+        if (end_idx > count) {
+            end_idx = count;
+        }
+
+        for (int i = start_idx; i < end_idx; i++) {
+            if (i == selected) {
+                pspDebugScreenPrintf("> %s\n", g_rom_list[i]);
+            } else {
+                pspDebugScreenPrintf("  %s\n", g_rom_list[i]);
+            }
+        }
+
+        pspDebugScreenSetXY(0, 28);
+        pspDebugScreenPrintf("[UP/DOWN] Navigate | [CROSS (X)] Launch Game | [START] Exit to XMB\n");
+
+        while (g_running) {
+            sceCtrlReadBufferPositive(&pad, 1);
+            unsigned int pressed = pad.Buttons & ~old_pad.Buttons;
+            old_pad = pad;
+
+            if (pressed & PSP_CTRL_UP) {
+                selected = (selected - 1 + count) % count;
+                break;
+            }
+            if (pressed & PSP_CTRL_DOWN) {
+                selected = (selected + 1) % count;
+                break;
+            }
+            if (pressed & PSP_CTRL_CROSS) {
+                strncpy(out_path, g_rom_paths[selected], max_len - 1);
+                out_path[max_len - 1] = '\0';
+                return 1;
+            }
+            if (pressed & PSP_CTRL_START) {
+                return 0;
+            }
+            sceDisplayWaitVblankStart();
+        }
+    }
+
+    return 0;
 }
 
 // ============================================================================
@@ -631,6 +863,9 @@ static void video_refresh_cb(const void *data, unsigned width, unsigned height, 
     }
 
     const char *notif = pspra_get_active_notification();
+    if (notif == NULL && g_sram_osd_frames > 0) {
+        notif = "SRAM Saved";
+    }
     if (notif != NULL) {
         osd_draw_banner(vram, notif);
         s_banner_was_active = 1;
@@ -707,6 +942,7 @@ int main(int argc, char *argv[]) {
     pspDebugScreenInit();
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
+    sceIoMkdir("saves", 0777);
 
     pspDebugScreenPrintf("==================================================\n");
     pspDebugScreenPrintf("   PSPRA Libretro SNES Frontend (Snes9x 2005)     \n");
@@ -722,18 +958,30 @@ int main(int argc, char *argv[]) {
         return 0;
     }
     int wifi_connected = (wifi_status == 1);
-    if (!wifi_connected) {
-        pspDebugScreenPrintf("\n[Net] Starting game in offline mode.\n");
+
+    // 3. Interactive ROM file selector (.sfc / .smc)
+    char selected_rom_path[256] = {0};
+    if (!select_rom_file(selected_rom_path, sizeof(selected_rom_path))) {
+        psp_wifi_shutdown();
+        sceKernelExitGame();
+        return 0;
     }
 
-    // 3. Read "rom.sfc" from the current directory
-    FILE *rom_fp = fopen("rom.sfc", "rb");
-    if (!rom_fp) {
-        rom_fp = fopen(SYSTEM_DIR_PATH "/rom.sfc", "rb");
+    pspDebugScreenClear();
+    pspDebugScreenSetXY(0, 0);
+    pspDebugScreenPrintf("==================================================\n");
+    pspDebugScreenPrintf("   PSPRA Libretro SNES Frontend (Snes9x 2005)     \n");
+    pspDebugScreenPrintf("==================================================\n");
+    if (!wifi_connected) {
+        pspDebugScreenPrintf("[Net] Starting game in offline mode.\n");
     }
+
+    build_sram_path(selected_rom_path, g_sram_path, sizeof(g_sram_path));
+
+    // 4. Read the selected ROM file into memory
+    FILE *rom_fp = fopen(selected_rom_path, "rb");
     if (!rom_fp) {
-        pspDebugScreenPrintf("[Fatal] Failed to open rom.sfc!\n");
-        pspDebugScreenPrintf("Place 'rom.sfc' in the same folder as EBOOT.PBP.\n");
+        pspDebugScreenPrintf("[Fatal] Failed to open %s!\n", selected_rom_path);
         sceKernelDelayThread(4000000);
         psp_wifi_shutdown();
         sceKernelExitGame();
@@ -746,7 +994,7 @@ int main(int argc, char *argv[]) {
 
     if (rom_file_len <= 0) {
         fclose(rom_fp);
-        pspDebugScreenPrintf("[Fatal] Invalid rom.sfc file size!\n");
+        pspDebugScreenPrintf("[Fatal] Invalid ROM file size for %s!\n", selected_rom_path);
         sceKernelDelayThread(3000000);
         psp_wifi_shutdown();
         sceKernelExitGame();
@@ -767,7 +1015,7 @@ int main(int argc, char *argv[]) {
     if (fread(rom_buf, 1, rom_size, rom_fp) != rom_size) {
         free(rom_buf);
         fclose(rom_fp);
-        pspDebugScreenPrintf("[Fatal] Failed to read rom.sfc into memory!\n");
+        pspDebugScreenPrintf("[Fatal] Failed to read %s into memory!\n", selected_rom_path);
         sceKernelDelayThread(3000000);
         psp_wifi_shutdown();
         sceKernelExitGame();
@@ -775,12 +1023,12 @@ int main(int argc, char *argv[]) {
     }
     fclose(rom_fp);
 
-    // 4. Compute SNES MD5 hash (stripping 512-byte SMC header if present)
+    // 5. Compute SNES MD5 hash (stripping 512-byte SMC header if present)
     char rom_md5[33];
     pspra_compute_snes_md5(rom_buf, rom_size, rom_md5);
-    pspDebugScreenPrintf("[ROM] Loaded rom.sfc, MD5: %s\n", rom_md5);
+    pspDebugScreenPrintf("[ROM] Loaded %s, MD5: %s\n", selected_rom_path, rom_md5);
 
-    // 5. Initialize Libretro callbacks and Snes9x 2005 core
+    // 6. Initialize Libretro callbacks and Snes9x 2005 core
     retro_set_environment(environment_cb);
     retro_set_video_refresh(video_refresh_cb);
     retro_set_audio_sample(audio_sample_cb);
@@ -791,7 +1039,7 @@ int main(int argc, char *argv[]) {
 
     struct retro_game_info game_info;
     memset(&game_info, 0, sizeof(game_info));
-    game_info.path = "rom.sfc";
+    game_info.path = selected_rom_path;
     game_info.data = rom_buf;
     game_info.size = rom_size;
     game_info.meta = NULL;
@@ -799,7 +1047,7 @@ int main(int argc, char *argv[]) {
     if (!retro_load_game(&game_info)) {
         free(rom_buf);
         retro_deinit();
-        pspDebugScreenPrintf("[Fatal] retro_load_game failed for rom.sfc!\n");
+        pspDebugScreenPrintf("[Fatal] retro_load_game failed for %s!\n", selected_rom_path);
         sceKernelDelayThread(3000000);
         psp_wifi_shutdown();
         sceKernelExitGame();
@@ -810,7 +1058,10 @@ int main(int argc, char *argv[]) {
     free(rom_buf);
     rom_buf = NULL;
 
-    // 6. Fetch SNES 128 KB Work RAM pointer & size from Libretro and initialize PSPRA
+    // 7. Load battery-backed SRAM (.srm) if available
+    load_sram_from_disk(g_sram_path);
+
+    // 8. Fetch SNES 128 KB Work RAM pointer & size from Libretro and initialize PSPRA
     uint8_t *wram = (uint8_t *)retro_get_memory_data(RETRO_MEMORY_SYSTEM_RAM);
     size_t wram_size = retro_get_memory_size(RETRO_MEMORY_SYSTEM_RAM);
     pspDebugScreenPrintf("[Core] SNES WRAM: %p (%u bytes)\n",
@@ -823,10 +1074,10 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // 7. Reserve PSP hardware audio channel (non-blocking stereo 512 samples)
+    // 9. Reserve PSP hardware audio channel (non-blocking stereo 512 samples)
     g_audio_ch = sceAudioChReserve(0, AUDIO_SAMPLES, PSP_AUDIO_FORMAT_STEREO);
 
-    // 8. Re-assert 333/166 MHz clock, switch display to 16-bit RGB565, and enter 60 FPS loop
+    // 10. Re-assert 333/166 MHz clock, switch display to 16-bit RGB565, and enter 60 FPS loop
     scePowerSetClockFrequency(333, 333, 166);
     g_in_gameplay = 1;
     pspDebugScreenSetOffset(PSP_VRAM_STRIDE * PSP_SCREEN_HEIGHT * 2);
@@ -838,12 +1089,31 @@ int main(int argc, char *argv[]) {
 
     uint32_t target_us = sceKernelGetSystemTimeLow();
     int skip_count = 0;
+    int sram_check_counter = 0;
 
     while (g_running) {
         target_us += 16667; // 60.0 FPS (16.667 ms per frame)
 
+        if (g_sram_osd_frames > 0) {
+            g_sram_osd_frames--;
+        }
+
         retro_run();
         pspra_update_frame();
+
+        // Periodic SRAM dirty check every 300 frames (5 seconds at 60 FPS)
+        sram_check_counter++;
+        if (sram_check_counter >= 300) {
+            sram_check_counter = 0;
+            if (g_sram_ptr != NULL && g_sram_size > 0) {
+                uint32_t cur_sum = compute_sram_checksum(g_sram_ptr, g_sram_size);
+                if (cur_sum != g_sram_checksum) {
+                    if (save_sram_to_disk(g_sram_path)) {
+                        g_sram_osd_frames = 90;
+                    }
+                }
+            }
+        }
 
         uint32_t now_us = sceKernelGetSystemTimeLow();
         int32_t ahead_us = (int32_t)(target_us - now_us);
@@ -871,12 +1141,15 @@ int main(int argc, char *argv[]) {
 
         // Exit combo: L + R + START + SELECT
         if ((g_pad.Buttons & EXIT_COMBO_MASK) == EXIT_COMBO_MASK) {
+            save_sram_to_disk(g_sram_path);
             g_running = 0;
         }
     }
 
-    // 9. Clean shutdown
+    // 11. Clean shutdown & final SRAM save
     g_in_gameplay = 0;
+    save_sram_to_disk(g_sram_path);
+
     if (g_audio_ch >= 0) {
         sceAudioChRelease(g_audio_ch);
         g_audio_ch = -1;
