@@ -1,5 +1,6 @@
 .env
 config.ini
+!config.ini.example
 credentials.h
 *secret*
 *token*

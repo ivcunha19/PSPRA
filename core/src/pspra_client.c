@@ -2,6 +2,7 @@
 #include <string.h>
 #include "md5.h"
 #include "rc_client.h"
+#include "pspra_config.h"
 #include "pspra_net.h"
 #include "pspra_client.h"
 
@@ -184,8 +185,8 @@ int pspra_init(uint8_t* ram_pointer, uint32_t ram_size) {
     rc_client_enable_logging(g_client, RC_CLIENT_LOG_LEVEL_INFO, pspra_log_message);
     rc_client_set_event_handler(g_client, pspra_event_handler);
 
-    // Strictly enforce Softcore mode for RetroAchievements compliance
-    rc_client_set_hardcore_enabled(g_client, 0);
+    // Apply hardcore/softcore mode from runtime configuration (default: 0 = Softcore)
+    rc_client_set_hardcore_enabled(g_client, pspra_config_get()->hardcore_mode);
 
     // Enable Encore Mode so achievements can be triggered repeatedly during hardware testing
     rc_client_set_encore_mode_enabled(g_client, 1);

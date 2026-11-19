@@ -10,11 +10,13 @@ CFLAGS  = -Wall -Wextra -g -O2 -pthread \
 
 # PSPRA Core & Test sources
 PSPRA_SRCS = main_linux.c \
+             ../core/src/pspra_config.c \
              ../core/src/pspra_net.c \
              ../core/src/pspra_client.c
 
-# Automatically find all .c files inside external/rcheevos/src (excluding rhash and libretro)
-RCHEEVOS_SRCS = $(shell find ../external/rcheevos/src -name "*.c" ! -path "*/rhash/*" ! -path "*/libretro/*")
+# Automatically find all .c files inside external/rcheevos/src (excluding rhash and libretro, except md5.c)
+RCHEEVOS_SRCS = $(wildcard ../external/rcheevos/src/rhash/md5.c) \
+                $(shell find ../external/rcheevos/src -name "*.c" ! -path "*/rhash/*" ! -path "*/libretro/*")
 
 OBJS   = $(PSPRA_SRCS:.c=.o) $(RCHEEVOS_SRCS:.c=.o)
 TARGET = pspra_test

@@ -1,9 +1,10 @@
 #ifndef PSPRA_CREDENTIALS_H
 #define PSPRA_CREDENTIALS_H
 
-#define PSPRA_PROXY_IP   "192.168.0.45"
-#define PSPRA_PROXY_PORT 9002
-#define PSPRA_RA_USER    "SEU_USUARIO_AQUI"
-#define PSPRA_RA_PASS    "SUA_SENHA_OU_TOKEN_AQUI"
+// Deprecated fallback defaults — runtime settings are now loaded from config.ini via pspra_config.h
+#define PSPRA_PROXY_IP   "127.0.0.1"
+#define PSPRA_PROXY_PORT 8080
+#define PSPRA_RA_USER    "YOUR_USERNAME"
+#define PSPRA_RA_PASS    "YOUR_PASSWORD"
 
 #endif

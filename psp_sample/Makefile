@@ -1,10 +1,12 @@
 TARGET = pspra_sample
 
 PSPRA_SRCS = main_psp.c \
+../core/src/pspra_config.c \
 ../core/src/pspra_net.c \
 ../core/src/pspra_client.c
 
-RCHEEVOS_SRCS = $(shell find ../external/rcheevos/src -name "*.c" \
+RCHEEVOS_SRCS = $(wildcard ../external/rcheevos/src/rhash/md5.c) \
+$(shell find ../external/rcheevos/src -name "*.c" \
 ! -path "*/rhash/*" \
 ! -path "*/libretro/*" \
 ! -name "rc_validate.c" \

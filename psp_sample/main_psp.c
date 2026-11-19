@@ -12,7 +12,7 @@
 #include <string.h>
 #include <stdint.h>
 
-#include "credentials.h"
+#include "pspra_config.h"
 #include "pspra_client.h"
 
 PSP_MODULE_INFO("PSPRA_Sample", 0, 1, 0);
@@ -201,13 +201,33 @@ static int psp_wifi_select_and_connect(void) {
         }
     }
 
+    const pspra_config_t *cfg = pspra_config_get();
+
     if (count == 0) {
-        pspDebugScreenPrintf("[Net] No saved Wi-Fi profiles found on this PSP!\n");
+        pspDebugScreenPrintf("[Net] No saved Wi-Fi profiles enumerated; trying wifi_profile #%d from config.ini...\n",
+                             cfg->wifi_profile);
+        if (sceNetApctlConnect(cfg->wifi_profile) == 0) {
+            WifiProfile fallback_prof;
+            memset(&fallback_prof, 0, sizeof(fallback_prof));
+            fallback_prof.id = cfg->wifi_profile;
+            strncpy(fallback_prof.name, "Config Profile", sizeof(fallback_prof.name) - 1);
+            strncpy(fallback_prof.ssid, "Default", sizeof(fallback_prof.ssid) - 1);
+            if (psp_wifi_connect_profile(&fallback_prof)) {
+                return 1;
+            }
+        }
         pspDebugScreenPrintf("[Net] Configure a network in PSP Settings -> Network Settings.\n");
         return 0;
     }
 
     int selected = 0;
+    for (int i = 0; i < count; i++) {
+        if (profiles[i].id == cfg->wifi_profile) {
+            selected = i;
+            break;
+        }
+    }
+
     SceCtrlData pad, old_pad;
     sceCtrlReadBufferPositive(&old_pad, 1);
 
@@ -216,7 +236,8 @@ static int psp_wifi_select_and_connect(void) {
         pspDebugScreenPrintf("==================================================\n");
         pspDebugScreenPrintf("   PSPRA - Select Wi-Fi Network                   \n");
         pspDebugScreenPrintf("==================================================\n");
-        pspDebugScreenPrintf("[Info] Proxy Target: %s:%d\n\n", PSPRA_PROXY_IP, PSPRA_PROXY_PORT);
+        pspDebugScreenPrintf("[Info] User: %s | Proxy Target: %s:%d | Profile: #%d\n\n",
+                             cfg->username, cfg->proxy_ip, cfg->proxy_port, cfg->wifi_profile);
         pspDebugScreenPrintf("Controls:\n");
         pspDebugScreenPrintf("  [UP/DOWN] Select Profile\n");
         pspDebugScreenPrintf("  [X / O]   Connect to selected network\n");
@@ -334,7 +355,35 @@ int main(int argc, char *argv[]) {
     pspDebugScreenPrintf("==================================================\n");
     pspDebugScreenPrintf("   PSPRA - PlayStation Portable Client Runner     \n");
     pspDebugScreenPrintf("==================================================\n");
-    pspDebugScreenPrintf("[Info] Proxy Target: %s:%d\n", PSPRA_PROXY_IP, PSPRA_PROXY_PORT);
+
+    int config_valid = pspra_config_load(NULL);
+    const pspra_config_t *cfg = pspra_config_get();
+
+    if (!config_valid || !pspra_config_has_valid_credentials()) {
+        FILE *check_fp = fopen("config.ini", "r");
+        if (check_fp) {
+            fclose(check_fp);
+        } else {
+            pspra_config_create_template("config.ini");
+        }
+        pspDebugScreenPrintf("\n[Config] RetroAchievements credentials are not configured.\n");
+        pspDebugScreenPrintf("[Config] Please edit 'config.ini' on your Memory Stick with your\n");
+        pspDebugScreenPrintf("[Config] RetroAchievements username, password, and proxy IP.\n");
+        pspDebugScreenPrintf("\nPress [START] to exit to XMB.\n");
+        SceCtrlData pad;
+        while (g_running) {
+            sceCtrlReadBufferPositive(&pad, 1);
+            if (pad.Buttons & PSP_CTRL_START) {
+                break;
+            }
+            sceDisplayWaitVblankStart();
+        }
+        sceKernelExitGame();
+        return 0;
+    }
+
+    pspDebugScreenPrintf("[Info] User: %s | Proxy Target: %s:%d\n",
+                         cfg->username, cfg->proxy_ip, cfg->proxy_port);
 
     uint8_t *dummy_ram = (uint8_t *)malloc(DUMMY_RAM_SIZE);
     if (!dummy_ram) {
@@ -347,7 +396,7 @@ int main(int argc, char *argv[]) {
 
     if (psp_wifi_select_and_connect()) {
         if (pspra_init(dummy_ram, DUMMY_RAM_SIZE)) {
-            pspra_login(PSPRA_RA_USER, PSPRA_RA_PASS);
+            pspra_login(cfg->username, cfg->password);
             pspra_load_game(TEST_ROM_HASH);
 
             // Baseline SMW WRAM State (Active Gameplay in Yoshi's Island 2)

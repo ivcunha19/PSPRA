@@ -3,7 +3,7 @@
 #include <string.h>
 #include <unistd.h> // For usleep()
 
-#include "credentials.h"
+#include "pspra_config.h"
 #include "pspra_client.h"
 
 // Simulated 128 KB of SNES Work RAM (WRAM)
@@ -18,17 +18,25 @@ int main(void) {
     printf("   PSPRA - Linux Local Integration Test Runner    \n");
     printf("==================================================\n");
 
-    // 1. Clear simulated RAM
+    // 1. Load runtime configuration from config.ini
+    if (!pspra_config_load(NULL)) {
+        pspra_config_create_template("config.ini");
+        printf("[Test Runner] Fatal: Please configure valid credentials in config.ini.\n");
+        return 1;
+    }
+    const pspra_config_t* cfg = pspra_config_get();
+
+    // 2. Clear simulated RAM
     memset(g_dummy_ram, 0, sizeof(g_dummy_ram));
 
-    // 2. Initialize the PSPRA client
+    // 3. Initialize the PSPRA client
     if (!pspra_init(g_dummy_ram, DUMMY_RAM_SIZE)) {
         printf("[Test Runner] Fatal: Could not initialize PSPRA.\n");
         return 1;
     }
 
-    // 3. Authenticate with RetroAchievements via the local Python proxy
-    pspra_login(PSPRA_RA_USER, PSPRA_RA_PASS);
+    // 4. Authenticate with RetroAchievements via the local Python proxy
+    pspra_login(cfg->username, cfg->password);
 
     // 4. Load achievement definitions for Super Mario World
     pspra_load_game(TEST_ROM_HASH);

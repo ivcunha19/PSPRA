@@ -1,0 +1,16 @@
+# PSPRA Runtime Configuration Example
+# Copy this file to config.ini (placed next to EBOOT.PBP or in ms0:/PSP/GAME/PSPRA/config.ini)
+
+[retroachievements]
+username = YOUR_RA_USERNAME
+password = YOUR_RA_PASSWORD
+hardcore_mode = 0
+
+[network]
+proxy_ip = 192.168.1.100
+proxy_port = 8080
+wifi_profile = 1
+
+[video]
+video_scale = 1
+video_filter = 1

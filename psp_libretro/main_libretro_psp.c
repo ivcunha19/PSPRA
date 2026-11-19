@@ -1,14 +1,18 @@
 #include <pspkernel.h>
 #include <pspdebug.h>
 #include <pspdisplay.h>
+#include <pspgu.h>
 #include <pspctrl.h>
 #include <psputility.h>
 #include <psppower.h>
 #include <pspaudio.h>
 #include <pspiofilemgr.h>
+#include <pspimpose.h>
 #include <pspnet.h>
 #include <pspnet_inet.h>
 #include <pspnet_apctl.h>
+#include <kubridge.h>
+#include <systemctrl.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,8 +24,9 @@
 
 #include <libretro.h>
 
-#include "credentials.h"
+#include "pspra_config.h"
 #include "pspra_client.h"
+#include "psp_home_ctrl_bin.h"
 
 PSP_MODULE_INFO("PSPRA_Libretro_SNES", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
@@ -53,6 +58,27 @@ static size_t   g_sram_size = 0;
 static uint32_t g_sram_checksum = 0;
 static char     g_sram_path[256] = {0};
 static int      g_sram_osd_frames = 0;
+
+// ============================================================================
+// PSP GU HARDWARE SCALER & VRAM TEXTURE STATE
+// ============================================================================
+#define PSP_TEX_VRAM_ADDR ((void *)0x44088000)
+
+static unsigned int __attribute__((aligned(16))) gu_list[4096];
+static void *g_draw_buffer_rel = (void *)0;
+static int g_video_scale = 1;     // 0 = 1:1, 1 = 4:3 (Default), 2 = Fullscreen (16:9)
+static int g_bilinear_filter = 1; // 0 = Nearest, 1 = Bilinear (Default)
+static int g_show_fps = 0;        // 0 = Off (Default), 1 = On
+static int g_current_fps = 0;
+static uint32_t g_fps_frame_count = 0;
+static uint32_t g_fps_last_us = 0;
+static unsigned g_last_tex_w = 256;
+static unsigned g_last_tex_h = 224;
+
+struct GuVertex {
+    unsigned short u, v;
+    short x, y, z;
+};
 
 // ============================================================================
 // COMPACT 8x8 ASCII BITMAP FONT (0x20 .. 0x7E) FOR OSD NOTIFICATION BANNER
@@ -176,28 +202,52 @@ static void osd_draw_char(uint16_t *vram, int x, int y, char c, uint16_t color) 
     }
 }
 
+static void vram_fill_rect(uint16_t *vram, int x, int y, int w, int h, uint16_t color) {
+    int x0 = (x < 0) ? 0 : x;
+    int y0 = (y < 0) ? 0 : y;
+    int x1 = (x + w > PSP_SCREEN_WIDTH) ? PSP_SCREEN_WIDTH : (x + w);
+    int y1 = (y + h > PSP_SCREEN_HEIGHT) ? PSP_SCREEN_HEIGHT : (y + h);
+    for (int py = y0; py < y1; py++) {
+        uint16_t *row = &vram[py * PSP_VRAM_STRIDE];
+        for (int px = x0; px < x1; px++) {
+            row[px] = color;
+        }
+    }
+}
+
+static void vram_draw_rect_border(uint16_t *vram, int x, int y, int w, int h, uint16_t color) {
+    vram_fill_rect(vram, x, y, w, 1, color);
+    vram_fill_rect(vram, x, y + h - 1, w, 1, color);
+    vram_fill_rect(vram, x, y, 1, h, color);
+    vram_fill_rect(vram, x + w - 1, y, 1, h, color);
+}
+
+static void vram_draw_text(uint16_t *vram, int x, int y, const char *text, uint16_t color) {
+    int cx = x;
+    for (const char *p = text; *p != '\0' && (cx + 8) <= PSP_SCREEN_WIDTH; p++) {
+        osd_draw_char(vram, cx, y, *p, color);
+        cx += 8;
+    }
+}
+
+static void vram_dim_screen(uint16_t *vram) {
+    for (int y = 0; y < PSP_SCREEN_HEIGHT; y++) {
+        uint32_t *row32 = (uint32_t *)&vram[y * PSP_VRAM_STRIDE];
+        for (int x = 0; x < (PSP_SCREEN_WIDTH / 2); x++) {
+            row32[x] = (row32[x] >> 1) & 0x7BEF7BEFu;
+        }
+    }
+}
+
 static void osd_draw_banner(uint16_t *vram, const char *text) {
     // Dark background bar across y = 0..16 with a gold bottom accent line
     const uint16_t bg_color     = 0x2082; // Dark blue-grey in BGR565
     const uint16_t border_color = 0x06BF; // Gold accent in BGR565
     const uint16_t text_color   = 0x07FF; // Bright yellow/gold in BGR565
 
-    for (int y = 0; y < 16; y++) {
-        uint16_t *row = &vram[y * PSP_VRAM_STRIDE];
-        for (int x = 0; x < PSP_SCREEN_WIDTH; x++) {
-            row[x] = bg_color;
-        }
-    }
-    uint16_t *border_row = &vram[16 * PSP_VRAM_STRIDE];
-    for (int x = 0; x < PSP_SCREEN_WIDTH; x++) {
-        border_row[x] = border_color;
-    }
-
-    int cx = 6;
-    for (const char *p = text; *p != '\0' && (cx + 8) <= PSP_SCREEN_WIDTH; p++) {
-        osd_draw_char(vram, cx, 4, *p, text_color);
-        cx += 8;
-    }
+    vram_fill_rect(vram, 0, 0, PSP_SCREEN_WIDTH, 16, bg_color);
+    vram_fill_rect(vram, 0, 16, PSP_SCREEN_WIDTH, 1, border_color);
+    vram_draw_text(vram, 6, 4, text, text_color);
 }
 
 static void osd_clear_banner(uint16_t *vram) {
@@ -299,6 +349,127 @@ static int setup_callbacks(void) {
         sceKernelStartThread(thid, 0, 0);
     }
     return thid;
+}
+
+// ============================================================================
+// 1A. KERNEL HOME BUTTON BRIDGE (BYPASSES NATIVE EXIT POPUP IN GAMEPLAY)
+// ============================================================================
+#define SCE_CTRL_PEEK_BUFFER_POSITIVE_NID 0x3A622550u
+#define HOME_CTRL_PRX_PATH "psp_home_ctrl.prx"
+
+enum HomeCtrlMode {
+    HOME_MODE_NONE = 0,
+    HOME_MODE_KUCALL = 1,
+    HOME_MODE_PRX = 2
+};
+
+static enum HomeCtrlMode g_home_mode = HOME_MODE_NONE;
+static uint32_t g_k_ctrl_peek_fn = 0;
+static SceUID g_home_prx_modid = -1;
+static volatile uint32_t g_kernel_buttons = 0;
+
+static int is_psp_stub_linked(const void *fn_ptr) {
+    const uint32_t *insns = (const uint32_t *)fn_ptr;
+    // Unresolved weak stubs begin with 0x00000000 (nop) followed by the NID.
+    return (insns != NULL && insns[0] != 0x00000000u);
+}
+
+static int write_embedded_home_prx(const char *path) {
+    SceUID fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    if (fd < 0) {
+        return 0;
+    }
+    int written = sceIoWrite(fd, psp_home_ctrl_prx, (int)size_psp_home_ctrl_prx);
+    sceIoClose(fd);
+    return (written == (int)size_psp_home_ctrl_prx) ? 1 : 0;
+}
+
+static void psp_home_ctrl_init(void) {
+    if (g_home_mode != HOME_MODE_NONE) {
+        return;
+    }
+
+    // Path A: Direct kernel sceCtrlPeekBufferPositive via kuKernelCall (ARK-4 / Adrenaline)
+    if (is_psp_stub_linked((const void *)sctrlHENFindFunction) &&
+        is_psp_stub_linked((const void *)kuKernelCall)) {
+        uint32_t fn = sctrlHENFindFunction("sceController_Service", "sceCtrl_driver",
+                                           SCE_CTRL_PEEK_BUFFER_POSITIVE_NID);
+        if (fn == 0) {
+            fn = sctrlHENFindFunction("sceController_Service", "sceCtrl",
+                                      SCE_CTRL_PEEK_BUFFER_POSITIVE_NID);
+        }
+        if (fn != 0) {
+            SceCtrlData test_pad;
+            struct KernelCallArg args;
+            memset(&test_pad, 0, sizeof(test_pad));
+            memset(&args, 0, sizeof(args));
+            args.arg1 = (uint32_t)&test_pad;
+            args.arg2 = 1;
+            if (kuKernelCall((void *)fn, &args) >= 0 && (int)args.ret1 >= 0) {
+                g_k_ctrl_peek_fn = fn;
+                g_home_mode = HOME_MODE_KUCALL;
+            }
+        }
+    }
+
+    // Path B: Fallback kernel helper PRX via kuKernelLoadModule (PRO / ME / M33)
+    if (g_home_mode == HOME_MODE_NONE &&
+        is_psp_stub_linked((const void *)kuKernelLoadModule)) {
+        SceUID modid = kuKernelLoadModule(HOME_CTRL_PRX_PATH, 0, NULL);
+        if (modid < 0 && write_embedded_home_prx(HOME_CTRL_PRX_PATH)) {
+            modid = kuKernelLoadModule(HOME_CTRL_PRX_PATH, 0, NULL);
+        }
+        if (modid >= 0) {
+            volatile uint32_t *btn_ptr = &g_kernel_buttons;
+            int status = 0;
+            if (sceKernelStartModule(modid, sizeof(btn_ptr), &btn_ptr, &status, NULL) >= 0) {
+                g_home_prx_modid = modid;
+                g_home_mode = HOME_MODE_PRX;
+            } else {
+                sceKernelUnloadModule(modid);
+            }
+        }
+    }
+
+    if (g_home_mode != HOME_MODE_NONE) {
+        // Suppress Sony's built-in "Do you want to quit?" dialog so HOME opens our menu
+        sceImposeSetHomePopup(0);
+    }
+}
+
+static void psp_home_ctrl_shutdown(void) {
+    if (g_home_mode != HOME_MODE_NONE) {
+        sceImposeSetHomePopup(1);
+    }
+    if (g_home_prx_modid >= 0) {
+        int status = 0;
+        sceKernelStopModule(g_home_prx_modid, 0, NULL, &status, NULL);
+        sceKernelUnloadModule(g_home_prx_modid);
+        g_home_prx_modid = -1;
+    }
+    g_home_mode = HOME_MODE_NONE;
+    g_k_ctrl_peek_fn = 0;
+}
+
+static uint32_t read_buttons_with_home(void) {
+    if (g_home_mode == HOME_MODE_KUCALL && g_k_ctrl_peek_fn != 0) {
+        SceCtrlData kpad;
+        struct KernelCallArg args;
+        memset(&kpad, 0, sizeof(kpad));
+        memset(&args, 0, sizeof(args));
+        args.arg1 = (uint32_t)&kpad;
+        args.arg2 = 1;
+        if (kuKernelCall((void *)g_k_ctrl_peek_fn, &args) >= 0) {
+            return kpad.Buttons;
+        }
+    } else if (g_home_mode == HOME_MODE_PRX) {
+        return g_kernel_buttons;
+    }
+
+    SceCtrlData pad;
+    memset(&pad, 0, sizeof(pad));
+    sceCtrlPeekBufferPositive(&pad, 1);
+    return pad.Buttons;
 }
 
 // ============================================================================
@@ -607,13 +778,33 @@ static int psp_wifi_select_and_connect(void) {
         }
     }
 
+    const pspra_config_t *cfg = pspra_config_get();
+
     if (count == 0) {
-        pspDebugScreenPrintf("[Net] No saved Wi-Fi profiles found on this PSP!\n");
+        pspDebugScreenPrintf("[Net] No saved Wi-Fi profiles enumerated; trying wifi_profile #%d from config.ini...\n",
+                             cfg->wifi_profile);
+        if (sceNetApctlConnect(cfg->wifi_profile) == 0) {
+            WifiProfile fallback_prof;
+            memset(&fallback_prof, 0, sizeof(fallback_prof));
+            fallback_prof.id = cfg->wifi_profile;
+            strncpy(fallback_prof.name, "Config Profile", sizeof(fallback_prof.name) - 1);
+            strncpy(fallback_prof.ssid, "Default", sizeof(fallback_prof.ssid) - 1);
+            if (psp_wifi_connect_profile(&fallback_prof)) {
+                return 1;
+            }
+        }
         pspDebugScreenPrintf("[Net] Configure a network in PSP Settings -> Network Settings.\n");
         return 0;
     }
 
     int selected = 0;
+    for (int i = 0; i < count; i++) {
+        if (profiles[i].id == cfg->wifi_profile) {
+            selected = i;
+            break;
+        }
+    }
+
     SceCtrlData pad, old_pad;
     sceCtrlReadBufferPositive(&old_pad, 1);
 
@@ -622,8 +813,8 @@ static int psp_wifi_select_and_connect(void) {
         pspDebugScreenPrintf("==================================================\n");
         pspDebugScreenPrintf("   PSPRA SNES9x2005 - Select Wi-Fi Network        \n");
         pspDebugScreenPrintf("==================================================\n");
-        pspDebugScreenPrintf("[Info] CPU Clock: 333 MHz | Proxy: %s:%d\n\n",
-                             PSPRA_PROXY_IP, PSPRA_PROXY_PORT);
+        pspDebugScreenPrintf("[Info] User: %s | Proxy: %s:%d | Default Profile: #%d\n\n",
+                             cfg->username, cfg->proxy_ip, cfg->proxy_port, cfg->wifi_profile);
         pspDebugScreenPrintf("Controls:\n");
         pspDebugScreenPrintf("  [UP/DOWN]  Select Profile\n");
         pspDebugScreenPrintf("  [X / O]    Connect to selected network\n");
@@ -810,69 +1001,270 @@ static bool environment_cb(unsigned cmd, void *data) {
     }
 }
 
+static void gu_render_game_texture(unsigned tex_w, unsigned tex_h,
+                                   const void *src_data, size_t src_pitch) {
+    sceGuStart(GU_DIRECT, gu_list);
+
+    if (src_data != NULL) {
+        // Upload SNES BGR555 framebuffer directly into fast EDRAM VRAM via GE DMA
+        sceGuCopyImage(GU_PSM_5551, 0, 0, (int)tex_w, (int)tex_h,
+                       (int)(src_pitch >> 1), (void *)src_data,
+                       0, 0, 512, PSP_TEX_VRAM_ADDR);
+        sceGuTexSync();
+    }
+
+    if (g_video_scale != 2) {
+        sceGuClearColor(0x00000000);
+        sceGuClear(GU_COLOR_BUFFER_BIT);
+    }
+
+    sceGuTexMode(GU_PSM_5551, 0, 0, 0);
+    sceGuTexImage(0, 512, 512, 512, PSP_TEX_VRAM_ADDR);
+    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
+    sceGuTexFilter(g_bilinear_filter ? GU_LINEAR : GU_NEAREST,
+                   g_bilinear_filter ? GU_LINEAR : GU_NEAREST);
+
+    short dst_x, dst_y, dst_w, dst_h;
+    if (g_video_scale == 0) {
+        // Mode 0: 1:1 Original
+        dst_w = (short)tex_w;
+        dst_h = (short)tex_h;
+        dst_x = (short)((PSP_SCREEN_WIDTH - dst_w) / 2);
+        dst_y = (short)((PSP_SCREEN_HEIGHT - dst_h) / 2);
+    } else if (g_video_scale == 2) {
+        // Mode 2: 16:9 Fullscreen
+        dst_w = PSP_SCREEN_WIDTH;
+        dst_h = PSP_SCREEN_HEIGHT;
+        dst_x = 0;
+        dst_y = 0;
+    } else {
+        // Mode 1: 4:3 Aspect Ratio (Default)
+        dst_h = PSP_SCREEN_HEIGHT;
+        dst_w = (PSP_SCREEN_HEIGHT * 4) / 3; // 362 px
+        dst_x = (PSP_SCREEN_WIDTH - dst_w) / 2;
+        dst_y = 0;
+    }
+
+    struct GuVertex *vertices = (struct GuVertex *)sceGuGetMemory(2 * sizeof(struct GuVertex));
+    if (vertices) {
+        vertices[0].u = 0;
+        vertices[0].v = 0;
+        vertices[0].x = dst_x;
+        vertices[0].y = dst_y;
+        vertices[0].z = 0;
+
+        vertices[1].u = (unsigned short)tex_w;
+        vertices[1].v = (unsigned short)tex_h;
+        vertices[1].x = (short)(dst_x + dst_w);
+        vertices[1].y = (short)(dst_y + dst_h);
+        vertices[1].z = 0;
+
+        sceGuDrawArray(GU_SPRITES, GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D, 2, 0, vertices);
+    }
+
+    sceGuFinish();
+    sceGuSync(0, 0);
+}
+
 static void video_refresh_cb(const void *data, unsigned width, unsigned height, size_t pitch) {
-    uint16_t *vram = PSP_VRAM_BASE;
-    static int s_banner_was_active = 0;
+    const void *upload_src = NULL;
+    unsigned tex_w = g_last_tex_w;
+    unsigned tex_h = g_last_tex_h;
 
     if (data != NULL && width > 0 && height > 0) {
-        const uint16_t *src = (const uint16_t *)data;
-        size_t src_stride = pitch >> 1;
+        tex_w = (width > 512) ? 512 : width;
+        tex_h = (height > 512) ? 512 : height;
+        g_last_tex_w = tex_w;
+        g_last_tex_h = tex_h;
 
-        unsigned copy_w = (width > PSP_SCREEN_WIDTH) ? PSP_SCREEN_WIDTH : width;
-        unsigned copy_h = (height > PSP_SCREEN_HEIGHT) ? PSP_SCREEN_HEIGHT : height;
-        unsigned offset_x = ((PSP_SCREEN_WIDTH - copy_w) >> 1) & ~1u;
-        unsigned offset_y = (PSP_SCREEN_HEIGHT - copy_h) >> 1;
-
-        if (g_pixel_format == RETRO_PIXEL_FORMAT_RGB565) {
-            unsigned pairs = copy_w >> 1;
-            unsigned pairs4 = pairs & ~3u;
-            for (unsigned y = 0; y < copy_h; y++) {
-                const uint32_t *src32 = (const uint32_t *)&src[y * src_stride];
-                uint32_t *dst32 = (uint32_t *)&vram[(offset_y + y) * PSP_VRAM_STRIDE + offset_x];
-                unsigned x = 0;
-                // Unrolled 32-bit burst blitter (8 pixels = 4x uint32_t words per iteration)
-                for (; x < pairs4; x += 4) {
-                    uint32_t p0 = src32[x + 0];
-                    uint32_t p1 = src32[x + 1];
-                    uint32_t p2 = src32[x + 2];
-                    uint32_t p3 = src32[x + 3];
-                    dst32[x + 0] = ((p0 & 0x001F001Fu) << 11) | (p0 & 0x07E007E0u) | ((p0 >> 11) & 0x001F001Fu);
-                    dst32[x + 1] = ((p1 & 0x001F001Fu) << 11) | (p1 & 0x07E007E0u) | ((p1 >> 11) & 0x001F001Fu);
-                    dst32[x + 2] = ((p2 & 0x001F001Fu) << 11) | (p2 & 0x07E007E0u) | ((p2 >> 11) & 0x001F001Fu);
-                    dst32[x + 3] = ((p3 & 0x001F001Fu) << 11) | (p3 & 0x07E007E0u) | ((p3 >> 11) & 0x001F001Fu);
-                }
-                for (; x < pairs; x++) {
-                    uint32_t p = src32[x];
-                    dst32[x] = ((p & 0x001F001Fu) << 11) | (p & 0x07E007E0u) | ((p >> 11) & 0x001F001Fu);
-                }
-            }
-        } else {
-            unsigned pairs = copy_w >> 1;
-            for (unsigned y = 0; y < copy_h; y++) {
-                const uint32_t *src32 = (const uint32_t *)&src[y * src_stride];
-                uint32_t *dst32 = (uint32_t *)&vram[(offset_y + y) * PSP_VRAM_STRIDE + offset_x];
-                for (unsigned x = 0; x < pairs; x++) {
-                    uint32_t p = src32[x];
-                    uint32_t r = (p >> 10) & 0x001F001Fu;
-                    uint32_t g = (p >> 5)  & 0x001F001Fu;
-                    uint32_t b =  p        & 0x001F001Fu;
-                    dst32[x] = (b << 11) | (g << 6) | r;
-                }
-            }
-        }
+        // Flush only the rendered frame range so the rest of the CPU D-cache stays hot
+        uintptr_t start = (uintptr_t)data & ~(uintptr_t)63;
+        uintptr_t end = ((uintptr_t)data + (size_t)tex_h * pitch + 63u) & ~(uintptr_t)63;
+        sceKernelDcacheWritebackRange((const void *)start, (unsigned int)(end - start));
+        upload_src = data;
     }
 
     const char *notif = pspra_get_active_notification();
     if (notif == NULL && g_sram_osd_frames > 0) {
         notif = "SRAM Saved";
     }
-    if (notif != NULL) {
-        osd_draw_banner(vram, notif);
-        s_banner_was_active = 1;
-    } else if (s_banner_was_active) {
-        osd_clear_banner(vram);
-        s_banner_was_active = 0;
+    int need_cpu_osd = (g_show_fps || notif != NULL);
+
+    gu_render_game_texture(tex_w, tex_h, upload_src, pitch);
+
+    // Update FPS counter over 500 ms windows
+    uint32_t now_us = sceKernelGetSystemTimeLow();
+    if (g_fps_last_us == 0) {
+        g_fps_last_us = now_us;
     }
+    g_fps_frame_count++;
+    uint32_t elapsed_us = now_us - g_fps_last_us;
+    if (elapsed_us >= 500000u) {
+        g_current_fps = (int)(((uint64_t)g_fps_frame_count * 1000000ULL + (elapsed_us / 2)) / elapsed_us);
+        g_fps_frame_count = 0;
+        g_fps_last_us = now_us;
+    }
+
+    // Render OSD FPS counter, achievement banner, or status toast directly onto VRAM
+    if (need_cpu_osd) {
+        uint16_t *vram = (uint16_t *)((uintptr_t)PSP_VRAM_BASE + (uintptr_t)g_draw_buffer_rel);
+        if (g_show_fps) {
+            char fps_text[16];
+            snprintf(fps_text, sizeof(fps_text), "FPS:%3d", g_current_fps);
+            vram_fill_rect(vram, PSP_SCREEN_WIDTH - 66, 4, 62, 14, 0x1861);
+            vram_draw_rect_border(vram, PSP_SCREEN_WIDTH - 66, 4, 62, 14, 0x06BF);
+            vram_draw_text(vram, PSP_SCREEN_WIDTH - 63, 7, fps_text, 0x07FF);
+        }
+        if (notif != NULL) {
+            osd_draw_banner(vram, notif);
+        }
+    }
+
+    g_draw_buffer_rel = sceGuSwapBuffers();
+}
+
+#define HOME_MENU_ITEMS 5
+
+static void draw_home_menu(uint16_t *vram, int selected) {
+    const uint16_t panel_bg     = 0x1861; // Dark navy-slate in BGR565
+    const uint16_t header_bg    = 0x28A3; // Slightly lighter header bar
+    const uint16_t border_color = 0x06BF; // Gold accent
+    const uint16_t div_color    = 0x39E7; // Subtle divider
+    const uint16_t sel_bg       = 0x4186; // Highlighted row background
+    const uint16_t title_color  = 0x07FF; // Bright yellow/gold
+    const uint16_t text_normal  = 0xFFFF; // White
+    const uint16_t text_hint    = 0xBDF7; // Light grey
+
+    const int box_x = 64;
+    const int box_y = 41;
+    const int box_w = 352;
+    const int box_h = 190;
+
+    // Dim the live game frame behind the menu so video changes are visible in real time
+    vram_dim_screen(vram);
+
+    vram_fill_rect(vram, box_x, box_y, box_w, box_h, panel_bg);
+    vram_fill_rect(vram, box_x, box_y, box_w, 22, header_bg);
+    vram_fill_rect(vram, box_x, box_y + 22, box_w, 1, border_color);
+    vram_draw_rect_border(vram, box_x, box_y, box_w, box_h, border_color);
+
+    const char *title = "PSPRA SNES - HOME MENU";
+    int title_x = box_x + (box_w - (int)strlen(title) * 8) / 2;
+    vram_draw_text(vram, title_x, box_y + 7, title, title_color);
+
+    const char *scale_label = "4:3 (Aspect)";
+    if (g_video_scale == 0) {
+        scale_label = "1:1 (256x224)";
+    } else if (g_video_scale == 2) {
+        scale_label = "Fullscreen";
+    }
+    const char *filter_label = g_bilinear_filter ? "Bilinear" : "Nearest";
+    const char *fps_label = g_show_fps ? "On" : "Off";
+
+    char items[HOME_MENU_ITEMS][44];
+    snprintf(items[0], sizeof(items[0]), "Resume Game");
+    snprintf(items[1], sizeof(items[1]), "Resolution:   < %s >", scale_label);
+    snprintf(items[2], sizeof(items[2]), "Video Filter: < %s >", filter_label);
+    snprintf(items[3], sizeof(items[3]), "FPS Counter:  < %s >", fps_label);
+    snprintf(items[4], sizeof(items[4]), "Exit to XMB");
+
+    for (int i = 0; i < HOME_MENU_ITEMS; i++) {
+        int row_y = box_y + 32 + i * 22;
+        if (i == selected) {
+            vram_fill_rect(vram, box_x + 8, row_y - 3, box_w - 16, 16, sel_bg);
+            vram_draw_rect_border(vram, box_x + 8, row_y - 3, box_w - 16, 16, border_color);
+            vram_draw_text(vram, box_x + 14, row_y + 1, ">", title_color);
+            vram_draw_text(vram, box_x + 28, row_y + 1, items[i], title_color);
+        } else {
+            vram_draw_text(vram, box_x + 28, row_y + 1, items[i], text_normal);
+        }
+    }
+
+    vram_fill_rect(vram, box_x + 12, box_y + 144, box_w - 24, 1, div_color);
+    vram_draw_text(vram, box_x + 28, box_y + 153, "[UP/DOWN] Select  [LEFT/RIGHT] Change", text_hint);
+    vram_draw_text(vram, box_x + 32, box_y + 167, "[X/O] Confirm     [HOME] Resume Game", text_hint);
+}
+
+static uint32_t read_menu_buttons(void) {
+    SceCtrlData pad;
+    memset(&pad, 0, sizeof(pad));
+    sceCtrlReadBufferPositive(&pad, 1);
+
+    uint32_t btns = pad.Buttons | (read_buttons_with_home() & PSP_CTRL_HOME);
+    if (pad.Ly < 64)  btns |= PSP_CTRL_UP;
+    if (pad.Ly > 192) btns |= PSP_CTRL_DOWN;
+    if (pad.Lx < 64)  btns |= PSP_CTRL_LEFT;
+    if (pad.Lx > 192) btns |= PSP_CTRL_RIGHT;
+    return btns;
+}
+
+static void adjust_home_menu_option(int selected, int delta) {
+    if (selected == 1) {
+        g_video_scale = (g_video_scale + 3 + delta) % 3;
+    } else if (selected == 2) {
+        g_bilinear_filter = !g_bilinear_filter;
+    } else if (selected == 3) {
+        g_show_fps = !g_show_fps;
+    }
+}
+
+static void run_home_menu(void) {
+    int selected = 0;
+    int menu_open = 1;
+    uint32_t prev_btns = read_menu_buttons() | PSP_CTRL_HOME;
+
+    while (g_running && menu_open) {
+        uint32_t btns = read_menu_buttons();
+        uint32_t pressed = btns & ~prev_btns;
+        prev_btns = btns;
+
+        if (pressed & PSP_CTRL_UP) {
+            selected = (selected + HOME_MENU_ITEMS - 1) % HOME_MENU_ITEMS;
+        }
+        if (pressed & PSP_CTRL_DOWN) {
+            selected = (selected + 1) % HOME_MENU_ITEMS;
+        }
+        if (pressed & PSP_CTRL_LEFT) {
+            adjust_home_menu_option(selected, -1);
+        }
+        if (pressed & PSP_CTRL_RIGHT) {
+            adjust_home_menu_option(selected, 1);
+        }
+        if (pressed & (PSP_CTRL_CROSS | PSP_CTRL_CIRCLE)) {
+            if (selected == 0) {
+                menu_open = 0;
+            } else if (selected == 4) {
+                save_sram_to_disk(g_sram_path);
+                g_running = 0;
+                menu_open = 0;
+            } else {
+                adjust_home_menu_option(selected, 1);
+            }
+        }
+        if (pressed & (PSP_CTRL_HOME | PSP_CTRL_TRIANGLE)) {
+            menu_open = 0;
+        }
+
+        // Re-render game frame behind the menu so resolution/filter changes show immediately
+        gu_render_game_texture(g_last_tex_w, g_last_tex_h, NULL, 0);
+        uint16_t *vram = (uint16_t *)((uintptr_t)PSP_VRAM_BASE + (uintptr_t)g_draw_buffer_rel);
+        draw_home_menu(vram, selected);
+
+        sceDisplayWaitVblankStart();
+        g_draw_buffer_rel = sceGuSwapBuffers();
+    }
+
+    // Wait for menu action buttons to be released so they don't leak into gameplay
+    if (g_running) {
+        const uint32_t release_mask =
+            PSP_CTRL_CROSS | PSP_CTRL_CIRCLE | PSP_CTRL_TRIANGLE | PSP_CTRL_HOME;
+        while (g_running && (read_menu_buttons() & release_mask) != 0) {
+            sceDisplayWaitVblankStart();
+        }
+        g_joypad_mask = 0;
+    }
+    g_fps_frame_count = 0;
+    g_fps_last_us = sceKernelGetSystemTimeLow();
 }
 
 static void audio_sample_cb(int16_t left, int16_t right) {
@@ -947,17 +1339,54 @@ int main(int argc, char *argv[]) {
     pspDebugScreenPrintf("==================================================\n");
     pspDebugScreenPrintf("   PSPRA Libretro SNES Frontend (Snes9x 2005)     \n");
     pspDebugScreenPrintf("==================================================\n");
-    pspDebugScreenPrintf("[Info] CPU Clock: 333 MHz | Proxy: %s:%d\n",
-                         PSPRA_PROXY_IP, PSPRA_PROXY_PORT);
 
-    // 2. Interactive Wi-Fi network selection menu (like psp_sample)
-    int wifi_status = psp_wifi_select_and_connect();
-    if (wifi_status < 0) {
-        psp_wifi_shutdown();
-        sceKernelExitGame();
-        return 0;
+    // 2. Load runtime configuration from config.ini
+    int config_valid = pspra_config_load(NULL);
+    const pspra_config_t *cfg = pspra_config_get();
+    g_video_scale = cfg->video_scale;
+    g_bilinear_filter = cfg->video_filter;
+    int wifi_connected = 0;
+
+    if (!config_valid || !pspra_config_has_valid_credentials()) {
+        FILE *check_fp = fopen("config.ini", "r");
+        if (check_fp) {
+            fclose(check_fp);
+        } else {
+            pspra_config_create_template("config.ini");
+        }
+        pspDebugScreenPrintf("\n[Config] RetroAchievements credentials are not configured.\n");
+        pspDebugScreenPrintf("[Config] Please edit 'config.ini' on your Memory Stick with your\n");
+        pspDebugScreenPrintf("[Config] RetroAchievements username, password, and proxy IP.\n");
+        pspDebugScreenPrintf("\nPress [CROSS (X)] to continue in Offline Mode, or [START] to exit.\n");
+
+        SceCtrlData pad, old_pad;
+        sceCtrlReadBufferPositive(&old_pad, 1);
+        while (g_running) {
+            sceCtrlReadBufferPositive(&pad, 1);
+            unsigned int pressed = pad.Buttons & ~old_pad.Buttons;
+            old_pad = pad;
+            if (pressed & (PSP_CTRL_CROSS | PSP_CTRL_CIRCLE)) {
+                break;
+            }
+            if (pressed & PSP_CTRL_START) {
+                sceKernelExitGame();
+                return 0;
+            }
+            sceDisplayWaitVblankStart();
+        }
+    } else {
+        pspDebugScreenPrintf("[Info] CPU Clock: 333 MHz | User: %s | Proxy: %s:%d\n",
+                             cfg->username, cfg->proxy_ip, cfg->proxy_port);
+
+        // Interactive Wi-Fi network selection menu (with cfg->wifi_profile pre-selected)
+        int wifi_status = psp_wifi_select_and_connect();
+        if (wifi_status < 0) {
+            psp_wifi_shutdown();
+            sceKernelExitGame();
+            return 0;
+        }
+        wifi_connected = (wifi_status == 1);
     }
-    int wifi_connected = (wifi_status == 1);
 
     // 3. Interactive ROM file selector (.sfc / .smc)
     char selected_rom_path[256] = {0};
@@ -1069,7 +1498,7 @@ int main(int argc, char *argv[]) {
 
     if (wifi_connected && wram != NULL && wram_size > 0) {
         if (pspra_init(wram, (uint32_t)wram_size)) {
-            pspra_login(PSPRA_RA_USER, PSPRA_RA_PASS);
+            pspra_login(cfg->username, cfg->password);
             pspra_load_game(rom_md5);
         }
     }
@@ -1077,21 +1506,51 @@ int main(int argc, char *argv[]) {
     // 9. Reserve PSP hardware audio channel (non-blocking stereo 512 samples)
     g_audio_ch = sceAudioChReserve(0, AUDIO_SAMPLES, PSP_AUDIO_FORMAT_STEREO);
 
-    // 10. Re-assert 333/166 MHz clock, switch display to 16-bit RGB565, and enter 60 FPS loop
+    // 10. Re-assert 333/166 MHz clock, initialize PSP GU hardware renderer, and enter 60 FPS loop
     scePowerSetClockFrequency(333, 333, 166);
     g_in_gameplay = 1;
+    psp_home_ctrl_init();
     pspDebugScreenSetOffset(PSP_VRAM_STRIDE * PSP_SCREEN_HEIGHT * 2);
-    memset(PSP_VRAM_BASE, 0, PSP_VRAM_STRIDE * PSP_SCREEN_HEIGHT * sizeof(uint16_t));
+    memset(PSP_VRAM_BASE, 0, PSP_VRAM_STRIDE * PSP_SCREEN_HEIGHT * 2 * sizeof(uint16_t));
+    memset(PSP_TEX_VRAM_ADDR, 0, 512 * 512 * sizeof(uint16_t));
+    sceKernelDcacheWritebackAll();
 
-    sceDisplaySetMode(0, PSP_SCREEN_WIDTH, PSP_SCREEN_HEIGHT);
-    sceDisplaySetFrameBuf((void *)0x44000000, PSP_VRAM_STRIDE,
-                          PSP_DISPLAY_PIXEL_FORMAT_565, PSP_DISPLAY_SETBUF_NEXTFRAME);
+    g_draw_buffer_rel = (void *)0;
+    sceGuInit();
+    sceGuStart(GU_DIRECT, gu_list);
+    sceGuDrawBuffer(GU_PSM_5650, (void *)0, 512);
+    sceGuDispBuffer(480, 272, (void *)0x44000, 512);
+    sceGuOffset(2048 - (480 / 2), 2048 - (272 / 2));
+    sceGuViewport(2048, 2048, 480, 272);
+    sceGuScissor(0, 0, 480, 272);
+    sceGuEnable(GU_SCISSOR_TEST);
+    sceGuEnable(GU_TEXTURE_2D);
+    sceGuFinish();
+    sceGuSync(0, 0);
+    sceDisplayWaitVblankStart();
+    sceGuDisplay(GU_TRUE);
 
     uint32_t target_us = sceKernelGetSystemTimeLow();
+    uint32_t prev_raw_btns = read_buttons_with_home();
     int skip_count = 0;
     int sram_check_counter = 0;
 
     while (g_running) {
+        uint32_t raw_btns = read_buttons_with_home();
+        uint32_t home_pressed = (raw_btns & ~prev_raw_btns) & PSP_CTRL_HOME;
+        prev_raw_btns = raw_btns;
+
+        if (home_pressed) {
+            run_home_menu();
+            prev_raw_btns = read_buttons_with_home();
+            target_us = sceKernelGetSystemTimeLow();
+            skip_count = 0;
+            if (!g_running) {
+                break;
+            }
+            continue;
+        }
+
         target_us += 16667; // 60.0 FPS (16.667 ms per frame)
 
         if (g_sram_osd_frames > 0) {
@@ -1148,7 +1607,9 @@ int main(int argc, char *argv[]) {
 
     // 11. Clean shutdown & final SRAM save
     g_in_gameplay = 0;
+    psp_home_ctrl_shutdown();
     save_sram_to_disk(g_sram_path);
+    sceGuTerm();
 
     if (g_audio_ch >= 0) {
         sceAudioChRelease(g_audio_ch);

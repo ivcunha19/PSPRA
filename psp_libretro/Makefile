@@ -1,6 +1,7 @@
 TARGET = pspra_snes_libretro
 
 PSPRA_SRCS = main_libretro_psp.c \
+             ../core/src/pspra_config.c \
              ../core/src/pspra_net.c \
              ../core/src/pspra_client.c
 
@@ -82,21 +83,30 @@ CFLAGS = -O3 -G0 -march=allegrex -fomit-frame-pointer -ffast-math -funroll-loops
          -Wno-array-bounds \
          -fno-strict-overflow \
          -UPSP \
+         -DPSP_BGR555 \
          -DLOAD_FROM_MEMORY \
          -DLAGFIX \
          -DUSE_OLD_COLOUR_OPS
 
 CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
 ASFLAGS = $(CFLAGS)
+LDFLAGS = -Wl,--gc-sections
 
 BUILD_PRX = 1
-LIBS = -lpsppower -lpspaudio
+LIBS = -lpspgu -lpspge -lpspdisplay -lpsppower -lpspaudio -lpspkubridge -lpspsystemctrl_user
 
+EXTRA_CLEAN = psp_home_ctrl_bin.h home_prx/psp_home_ctrl.prx home_prx/psp_home_ctrl.elf home_prx/psp_home_ctrl.o
 EXTRA_TARGETS = EBOOT.PBP
 PSP_EBOOT_TITLE = PSPRA SNES9x2005
 
 PSPSDK = $(shell psp-config --pspsdk-path)
 include $(PSPSDK)/lib/build.mak
+
+psp_home_ctrl_bin.h: home_prx/psp_home_ctrl.c home_prx/Makefile
+	$(MAKE) -C home_prx
+	bin2c home_prx/psp_home_ctrl.prx psp_home_ctrl_bin.h psp_home_ctrl_prx
+
+main_libretro_psp.o: main_libretro_psp.c psp_home_ctrl_bin.h
 
 %.prx: %.elf
 	psp-fixup-imports $<

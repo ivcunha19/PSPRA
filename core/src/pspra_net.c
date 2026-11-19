@@ -17,7 +17,7 @@
 #define PSPRA_LOG(...) printf(__VA_ARGS__)
 #endif
 
-#include "credentials.h"
+#include "pspra_config.h"
 #include "pspra_net.h"
 
 #define PSPRA_NET_QUEUE_SIZE 8
@@ -104,13 +104,15 @@ static int perform_proxy_http_request(const char* url, const char* post_data,
         return 500;
     }
 
+    const pspra_config_t* cfg = pspra_config_get();
+
     struct sockaddr_in serverAddress;
     memset(&serverAddress, 0, sizeof(serverAddress));
     serverAddress.sin_family = AF_INET;
-    serverAddress.sin_port = htons(PSPRA_PROXY_PORT);
+    serverAddress.sin_port = htons((uint16_t)cfg->proxy_port);
 
-    if (inet_pton(AF_INET, PSPRA_PROXY_IP, &serverAddress.sin_addr) <= 0) {
-        printf("[PSPRA Net] Invalid proxy IP address: %s\n", PSPRA_PROXY_IP);
+    if (inet_pton(AF_INET, cfg->proxy_ip, &serverAddress.sin_addr) <= 0) {
+        printf("[PSPRA Net] Invalid proxy IP address: %s\n", cfg->proxy_ip);
         close(networkSocket);
         return 500;
     }
